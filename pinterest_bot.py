@@ -19,8 +19,6 @@ import logging
 import tempfile
 from urllib import request as urlrequest
 import re
-import html
-import io
 
 from telegram import (
     Update,
@@ -40,10 +38,6 @@ from telegram.ext import (
     ContextTypes,
 )
 import yt_dlp
-import requests
-import cv2
-import numpy as np
-from PIL import Image
 
 # ─────────────────────────────────────────────
 # CONFIG  ← set env vars instead of hardcoding secrets
@@ -63,25 +57,15 @@ logger = logging.getLogger(__name__)
 # UI / MENU
 # ─────────────────────────────────────────────
 MENU_DOWNLOAD = "📌 Download Video"
-MENU_UPSCALE = "🔍 Upscale Image"
 MENU_HELP = "❓ Help"
 MENU_ABOUT = "ℹ️ About"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton(MENU_DOWNLOAD), KeyboardButton(MENU_UPSCALE)],
+        [KeyboardButton(MENU_DOWNLOAD)],
         [KeyboardButton(MENU_HELP), KeyboardButton(MENU_ABOUT)],
     ],
     resize_keyboard=True,
-)
-
-ACTIONS_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("📌 Download Video", callback_data="menu:download"),
-            InlineKeyboardButton("🔍 Upscale Image", callback_data="menu:upscale"),
-        ]
-    ]
 )
 
 QUALITY_FORMATS = {
@@ -97,20 +81,6 @@ QUALITY_KEYBOARD = InlineKeyboardMarkup(
             InlineKeyboardButton("📱 360p", callback_data="q:360"),
             InlineKeyboardButton("📺 540p", callback_data="q:540"),
             InlineKeyboardButton("🎬 720p", callback_data="q:720"),
-        ]
-    ]
-)
-
-UPSCALE_PROMPT_KEYBOARD = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("🔍 Upscale Image", callback_data="up:prompt")]]
-)
-
-UPSCALE_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("2x", callback_data="upscale:2"),
-            InlineKeyboardButton("3x", callback_data="upscale:3"),
-            InlineKeyboardButton("4x", callback_data="upscale:4"),
         ]
     ]
 )
@@ -207,147 +177,6 @@ def extract_urls(text: str) -> list[str]:
     return re.findall(r"https?://\S+", text)
 
 
-def is_image_url(url: str) -> bool:
-    """Return True if the URL ends with a supported image extension."""
-    cleaned = url.split("?")[0].lower()
-    return cleaned.endswith((".jpg", ".jpeg", ".png", ".webp"))
-
-def normalize_pinterest_url(url: str) -> str:
-    """Normalize Pinterest URLs to a canonical pin URL when possible."""
-    if not url:
-        return url
-    if "pinimg.com" in url:
-        return url.split("#")[0]
-    clean = url.split("#")[0]
-    match = re.search(r"/pin/(\d+)", clean)
-    if match:
-        pin_id = match.group(1)
-        return f"https://www.pinterest.com/pin/{pin_id}/"
-    return clean.split("?")[0]
-
-
-def _oembed_image_url(pin_url: str) -> str | None:
-    """Try Pinterest oEmbed to get a thumbnail image URL."""
-    try:
-        pin_url = normalize_pinterest_url(pin_url)
-        oembed_url = "https://www.pinterest.com/oembed.json"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(oembed_url, params={"url": pin_url}, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        thumb = data.get("thumbnail_url")
-        if thumb:
-            return thumb
-    except Exception as e:
-        logger.info("oEmbed lookup failed: %s", e)
-    return None
-
-
-def detect_pinterest_image(
-    pin_url: str, allow_thumbnail: bool = False, strict_video_check: bool = True
-) -> str | None:
-    """
-    Detect if a Pinterest URL is an image pin.
-    Returns a direct image URL when possible, otherwise None.
-    """
-    pin_url = normalize_pinterest_url(pin_url)
-    if is_image_url(pin_url):
-        return pin_url
-    if "pinimg.com" in pin_url:
-        return pin_url
-    if allow_thumbnail:
-        oembed_img = _oembed_image_url(pin_url)
-        if oembed_img:
-            return oembed_img
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        resp = requests.get(pin_url, headers=headers, timeout=10, allow_redirects=True)
-        resp.raise_for_status()
-        page = resp.text
-    except Exception as e:
-        logger.warning("Failed to fetch pin page: %s", e)
-        if allow_thumbnail:
-            return _oembed_image_url(pin_url)
-        return None
-
-    # If video metadata exists, treat it as a video pin
-    has_video = bool(re.search(r'property="og:video', page))
-    if strict_video_check and has_video:
-        return None
-
-    match = re.search(r'property="og:image"\s+content="([^"]+)"', page)
-    if not match:
-        match = re.search(r'name="og:image"\s+content="([^"]+)"', page)
-    if match:
-        return html.unescape(match.group(1))
-    # Fallback: look for any pinimg URL in the HTML
-    pinimgs = re.findall(r"https?://i\.pinimg\.com/[^\s\"']+", page)
-    if pinimgs:
-        for img_url in pinimgs:
-            if "/originals/" in img_url:
-                return img_url
-        return pinimgs[0]
-    if allow_thumbnail:
-        return _oembed_image_url(pin_url)
-    return None
-
-
-def upscale_image_bytes(image_bytes: bytes, scale: int) -> tuple[bytes | None, tuple[int, int] | None, tuple[int, int] | None, str | None, str | None]:
-    """
-    Upscale an image using OpenCV Lanczos interpolation.
-    Returns (bytes, original_size, new_size, ext, error).
-    """
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-    except Exception as e:
-        return None, None, None, None, f"Failed to open image: {e}"
-
-    fmt = (img.format or "").upper()
-    if fmt == "JPG":
-        fmt = "JPEG"
-    if fmt not in {"JPEG", "PNG", "WEBP"}:
-        return None, None, None, None, "Unsupported image format."
-
-    orig_w, orig_h = img.size
-    if orig_w > 3000:
-        return None, (orig_w, orig_h), None, None, "Image is already large."
-
-    # Preserve alpha if present
-    has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
-    if has_alpha:
-        img = img.convert("RGBA")
-        np_img = np.array(img)
-        cv_img = cv2.cvtColor(np_img, cv2.COLOR_RGBA2BGRA)
-    else:
-        img = img.convert("RGB")
-        np_img = np.array(img)
-        cv_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
-
-    new_w, new_h = orig_w * scale, orig_h * scale
-    resized = cv2.resize(cv_img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-
-    if has_alpha:
-        rgb_img = cv2.cvtColor(resized, cv2.COLOR_BGRA2RGBA)
-        out_img = Image.fromarray(rgb_img, mode="RGBA")
-    else:
-        rgb_img = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        out_img = Image.fromarray(rgb_img, mode="RGB")
-
-    buf = io.BytesIO()
-    ext = "png" if fmt == "PNG" else "webp" if fmt == "WEBP" else "jpg"
-    if fmt == "JPEG":
-        out_img = out_img.convert("RGB")
-        # Max quality JPEG with no chroma subsampling
-        out_img.save(buf, format="JPEG", quality=100, subsampling=0, optimize=True)
-    elif fmt == "PNG":
-        # Lossless
-        out_img.save(buf, format="PNG")
-    else:
-        # Lossless WebP to preserve quality
-        out_img.save(buf, format="WEBP", lossless=True, quality=100, method=6)
-    return buf.getvalue(), (orig_w, orig_h), (new_w, new_h), ext, None
-
-
 # ─────────────────────────────────────────────
 # HANDLERS
 # ─────────────────────────────────────────────
@@ -363,12 +192,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Batch download*\n"
         "• Send up to 5 links in one message (one per line)\n"
         "• Pick quality once and I’ll download them one by one\n\n"
-        "*Image upscaling*\n"
-        "• Detects image pins and lets you upscale 2x/3x/4x\n\n"
         "Tap a button below or paste a link to get started."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
-    await update.message.reply_text("Quick actions:", reply_markup=ACTIONS_KEYBOARD)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -382,9 +208,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Batch download (up to 5 links)*\n"
         "• Send multiple Pinterest links in one message, one per line.\n"
         "• Choose a quality once, and I’ll download them sequentially.\n\n"
-        "*Image upscaling*\n"
-        "• Tap *Upscale Image* and send the image link, or\n"
-        "• Use `/upscale <image url>` and choose 2x/3x/4x.\n\n"
         "For issues, make sure the Pin actually contains a video."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
@@ -400,82 +223,16 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
-async def begin_upscale_from_url(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, strict_video_check: bool
-) -> None:
-    """Start the upscale flow for a given URL."""
-    loop = asyncio.get_event_loop()
-    resolved_url = await loop.run_in_executor(None, expand_url, url)
-    image_url = await loop.run_in_executor(
-        None, detect_pinterest_image, resolved_url, True, strict_video_check
-    )
-    if not image_url:
-        await update.message.reply_text(
-            "⚠️ That link doesn’t look like an image pin.\n"
-            "Send a Pinterest image URL to upscale.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    context.user_data["pending_image_url"] = image_url
-    await update.message.reply_text(
-        "Select upscale factor (default 2x):",
-        reply_markup=UPSCALE_KEYBOARD,
-    )
-
-
-async def upscale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Upscale a Pinterest image via /upscale <url>."""
-    message = update.message
-    if not context.args:
-        context.user_data["awaiting_upscale_url"] = True
-        await message.reply_text(
-            "🔍 Send the Pinterest image link now.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith("http"):
-        await message.reply_text(
-            "❓ Please provide a valid URL (starts with https://).",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    await begin_upscale_from_url(update, context, url, strict_video_check=False)
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Main handler — download and send the video."""
     message = update.message
     text = (message.text or "").strip()
 
-    # If user requested upscale flow, accept the next link
-    if context.user_data.get("awaiting_upscale_url"):
-        urls = extract_urls(text)
-        if not urls:
-            await message.reply_text(
-                "🔍 Please send a Pinterest image link.",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            return
-        context.user_data["awaiting_upscale_url"] = False
-        await begin_upscale_from_url(update, context, urls[0], strict_video_check=False)
-        return
-
     # Menu buttons
     if text == MENU_DOWNLOAD:
         await message.reply_text(
             "📌 Send me a Pinterest video link (starts with https://).",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-    if text == MENU_UPSCALE:
-        context.user_data["awaiting_upscale_url"] = True
-        await message.reply_text(
-            "🔍 Send the Pinterest image link now (or use `/upscale <url>`).",
-            parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -503,21 +260,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=MAIN_KEYBOARD,
         )
         return
-
-    # If a single URL points to an image pin, offer upscale option
-    if len(pinterest_urls) == 1:
-        loop = asyncio.get_event_loop()
-        resolved_url = await loop.run_in_executor(None, expand_url, pinterest_urls[0])
-        image_url = await loop.run_in_executor(
-            None, detect_pinterest_image, resolved_url, True, True
-        )
-        if image_url:
-            context.user_data["pending_image_url"] = image_url
-            await message.reply_text(
-                "🖼️ I found an image pin. Want to upscale it?",
-                reply_markup=UPSCALE_PROMPT_KEYBOARD,
-            )
-            return
 
     if len(pinterest_urls) > 5:
         await message.reply_text(
@@ -605,110 +347,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["pending_urls"] = []
 
 
-async def upscale_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show upscale options after image detection."""
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-
-    image_url = context.user_data.get("pending_image_url")
-    if not image_url:
-        await query.edit_message_text("⚠️ No image to upscale. Send a link again.")
-        return
-
-    await query.edit_message_text(
-        "Select upscale factor (default 2x):",
-        reply_markup=UPSCALE_KEYBOARD,
-    )
-
-async def menu_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline menu actions without sending a user message."""
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-
-    if query.data == "menu:download":
-        await query.message.reply_text(
-            "📌 Send me a Pinterest video link (starts with https://).",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-    if query.data == "menu:upscale":
-        context.user_data["awaiting_upscale_url"] = True
-        await query.message.reply_text(
-            "🔍 Send the Pinterest image link now (or use `/upscale <url>`).",
-            parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-
-async def upscale_scale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle upscale factor selection."""
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-
-    data = query.data or ""
-    scale_str = data.split(":")[1] if ":" in data else ""
-    if scale_str not in {"2", "3", "4"}:
-        await query.edit_message_text("⚠️ Invalid upscale option.")
-        return
-    scale = int(scale_str)
-
-    image_url = context.user_data.get("pending_image_url")
-    if not image_url:
-        await query.edit_message_text("⚠️ No image to upscale. Send a link again.")
-        return
-
-    logger.info("Upscaling image | scale=%sx | url=%s", scale, image_url)
-    await query.edit_message_text(f"⏳ Upscaling {scale}x…")
-
-    def _download_and_upscale() -> tuple[bytes | None, tuple[int, int] | None, tuple[int, int] | None, str | None, str | None]:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(image_url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        return upscale_image_bytes(resp.content, scale)
-
-    loop = asyncio.get_event_loop()
-    try:
-        img_bytes, orig_size, new_size, ext, err = await loop.run_in_executor(
-            None, _download_and_upscale
-        )
-    except Exception as e:
-        logger.error("Upscale failed: %s", e)
-        await query.edit_message_text("❌ Failed to upscale image. Please try again.")
-        return
-
-    if err:
-        if err == "Image is already large." and orig_size:
-            await query.edit_message_text(
-                f"⚠️ Image is already large ({orig_size[0]}x{orig_size[1]}). Upscaling skipped."
-            )
-        else:
-            await query.edit_message_text(f"❌ {err}")
-        return
-
-    if not img_bytes or not orig_size or not new_size or not ext:
-        await query.edit_message_text("❌ Failed to upscale image.")
-        return
-
-    caption = f"✅ Upscaled from {orig_size[0]}x{orig_size[1]} → {new_size[0]}x{new_size[1]}"
-    bio = io.BytesIO(img_bytes)
-    bio.name = f"upscaled_{scale}x.{ext}"
-
-    await query.message.reply_document(
-        document=bio,
-        caption=caption,
-        filename=bio.name,
-    )
-    await query.edit_message_text("✅ Done.")
-    context.user_data["pending_image_url"] = None
-
-
 async def post_init(app: Application) -> None:
     """Set bot commands and menu button."""
     try:
@@ -718,7 +356,6 @@ async def post_init(app: Application) -> None:
                 BotCommand("help", "How to use the bot"),
                 BotCommand("about", "About this bot"),
                 BotCommand("menu", "Show menu buttons"),
-                BotCommand("upscale", "Upscale a Pinterest image"),
             ]
         )
         await app.bot.set_my_short_description("Download Pinterest videos instantly.")
@@ -751,11 +388,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("menu", start))
-    app.add_handler(CommandHandler("upscale", upscale_command))
     app.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^q:"))
-    app.add_handler(CallbackQueryHandler(menu_action_callback, pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(upscale_prompt_callback, pattern=r"^up:prompt$"))
-    app.add_handler(CallbackQueryHandler(upscale_scale_callback, pattern=r"^upscale:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running… Press Ctrl+C to stop.")
