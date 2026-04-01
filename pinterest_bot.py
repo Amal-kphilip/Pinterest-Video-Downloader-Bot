@@ -17,7 +17,8 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import logging
 import tempfile
-from urllib import request as urlrequest, error as urlerror
+from urllib import request as urlrequest
+import re
 
 from telegram import (
     Update,
@@ -25,10 +26,13 @@ from telegram import (
     KeyboardButton,
     BotCommand,
     MenuButtonCommands,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -39,7 +43,6 @@ import yt_dlp
 # CONFIG  ← set env vars instead of hardcoding secrets
 # ─────────────────────────────────────────────
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-PROXY_URL = os.getenv("PIN_PROXY_URL")
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -65,6 +68,22 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+QUALITY_CHOICES = {
+    "360": "V_HLSV3_MOBILE-523/best",
+    "540": "V_HLSV3_MOBILE-808/V_HLSV3_MOBILE-523/best",
+    "720": "V_HLSV3_MOBILE-1299/V_HLSV3_MOBILE-808/V_HLSV3_MOBILE-523/best",
+}
+
+QUALITY_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("📱 360p", callback_data="q:360"),
+            InlineKeyboardButton("📺 540p", callback_data="q:540"),
+            InlineKeyboardButton("🎬 720p", callback_data="q:720"),
+        ]
+    ]
+)
+
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
@@ -80,7 +99,7 @@ def is_pinterest_url(url: str) -> bool:
     return any(domain in url.lower() for domain in pinterest_domains)
 
 
-def download_pinterest_video(url: str, output_dir: str) -> str | None:
+def download_pinterest_video(url: str, output_dir: str, format_string: str) -> str | None:
     """
     Download the best-quality video from a Pinterest URL.
     Returns the file path on success, None on failure.
@@ -89,10 +108,8 @@ def download_pinterest_video(url: str, output_dir: str) -> str | None:
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     ydl_opts = {
-        # Let yt-dlp pick the best available format for each pin.
-        # The previous hardcoded Pinterest formats can fail on many pins.
-        # Video-only (no audio) as requested
-        "format": "bestvideo*/best",
+        # Video-only, with quality fallback
+        "format": format_string,
         "outtmpl": output_template,
         "quiet": True,
         "no_warnings": True,
@@ -100,8 +117,6 @@ def download_pinterest_video(url: str, output_dir: str) -> str | None:
         "socket_timeout": 30,
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
     }
-    if PROXY_URL:
-        ydl_opts["proxy"] = PROXY_URL
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -142,6 +157,11 @@ def expand_url(url: str) -> str:
         except Exception as e:
             logger.warning("Failed to expand URL %s: %s", url, e)
             return url
+
+
+def extract_urls(text: str) -> list[str]:
+    """Extract URLs from text."""
+    return re.findall(r"https?://\S+", text)
 
 
 # ─────────────────────────────────────────────
@@ -204,15 +224,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await about_command(update, context)
         return
 
-    # Basic URL check
-    if not text.startswith("http"):
+    urls = extract_urls(text)
+    if not urls:
         await message.reply_text(
             "❓ Please send a valid Pinterest URL (starts with https://).",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    if not is_pinterest_url(text):
+    pinterest_urls = [u for u in urls if is_pinterest_url(u)]
+    if not pinterest_urls:
         await message.reply_text(
             "⚠️ That doesn't look like a Pinterest link.\n"
             "Please send a `pinterest.com` or `pin.it` URL.",
@@ -221,50 +242,89 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Acknowledge
-    status_msg = await message.reply_text("⏳ Downloading your video, please wait…")
+    if len(pinterest_urls) > 5:
+        await message.reply_text(
+            "⚠️ You can send up to 5 links at a time. I’ll process the first 5.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        pinterest_urls = pinterest_urls[:5]
 
+    context.user_data["pending_urls"] = pinterest_urls
+    await message.reply_text(
+        f"Select a quality for {len(pinterest_urls)} video(s):",
+        reply_markup=QUALITY_KEYBOARD,
+    )
+    return
+
+
+async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle quality selection and download batch."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    quality = data.split(":")[1] if ":" in data else None
+    if quality not in QUALITY_CHOICES:
+        await query.edit_message_text("⚠️ Invalid quality selection. Please try again.")
+        return
+
+    urls = context.user_data.get("pending_urls") or []
+    if not urls:
+        await query.edit_message_text("⚠️ No pending downloads. Send a link again.")
+        return
+
+    format_string = QUALITY_CHOICES[quality]
+    await query.edit_message_text(f"✅ Selected {quality}p. Starting downloads…")
+
+    # Process each URL sequentially
     with tempfile.TemporaryDirectory() as tmpdir:
         loop = asyncio.get_event_loop()
-        resolved_url = await loop.run_in_executor(None, expand_url, text)
-        video_path = await loop.run_in_executor(
-            None, download_pinterest_video, resolved_url, tmpdir
-        )
-
-        if not video_path:
-            await status_msg.edit_text(
-                "❌ Sorry, I couldn't download that video.\n\n"
-                "Possible reasons:\n"
-                "• The Pin is not a video (it may be an image or idea pin)\n"
-                "• The Pin is private or deleted\n"
-                "• Pinterest blocked the request — try again in a moment"
+        total = len(urls)
+        for idx, url in enumerate(urls, start=1):
+            logger.info("Downloading %s/%s | quality=%sp | url=%s", idx, total, quality, url)
+            status_msg = await query.message.reply_text(
+                f"⏳ Downloading video {idx} of {total}…"
             )
-            return
-
-        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-
-        if file_size_mb > 50:
-            await status_msg.edit_text(
-                f"⚠️ Video is too large ({file_size_mb:.1f} MB).\n"
-                "Telegram bots can only send files up to 50 MB."
+            resolved_url = await loop.run_in_executor(None, expand_url, url)
+            video_path = await loop.run_in_executor(
+                None, download_pinterest_video, resolved_url, tmpdir, format_string
             )
-            return
 
-        await status_msg.edit_text("📤 Sending your video…")
-
-        try:
-            with open(video_path, "rb") as video_file:
-                await message.reply_video(
-                    video=video_file,
-                    caption="✅ Here's your Pinterest video — no watermark!",
-                    supports_streaming=True,
+            if not video_path:
+                logger.warning("Failed download %s/%s | url=%s", idx, total, url)
+                await status_msg.edit_text(
+                    f"❌ Failed to download video {idx} of {total}.\n{url}"
                 )
-            await status_msg.delete()
-        except Exception as e:
-            logger.error("Failed to send video: %s", e)
-            await status_msg.edit_text(
-                "❌ Failed to upload the video. Please try again."
-            )
+                continue
+
+            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            if file_size_mb > 50:
+                await status_msg.edit_text(
+                    f"⚠️ Video {idx} is too large ({file_size_mb:.1f} MB).\n"
+                    "Telegram bots can only send files up to 50 MB."
+                )
+                continue
+
+            await status_msg.edit_text("📤 Sending your video…")
+
+            try:
+                with open(video_path, "rb") as video_file:
+                    await query.message.reply_video(
+                        video=video_file,
+                        caption="✅ Here's your Pinterest video — no watermark!",
+                        supports_streaming=True,
+                    )
+                await status_msg.delete()
+                logger.info("Sent video %s/%s", idx, total)
+            except Exception as e:
+                logger.error("Failed to send video %s/%s: %s", idx, total, e)
+                await status_msg.edit_text(
+                    f"❌ Failed to upload video {idx}. Please try again."
+                )
+
+    context.user_data["pending_urls"] = []
 
 
 async def post_init(app: Application) -> None:
@@ -308,6 +368,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("menu", start))
+    app.add_handler(CallbackQueryHandler(quality_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running… Press Ctrl+C to stop.")

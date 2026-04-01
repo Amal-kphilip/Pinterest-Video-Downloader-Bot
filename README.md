@@ -6,6 +6,8 @@ A simple Telegram bot that downloads Pinterest videos and sends the clean MP4 ba
 
 - Accepts `pinterest.com` and `pin.it` links
 - Downloads the best available quality via `yt-dlp`
+- Lets users pick 360p / 540p / 720p
+- Supports batch downloads (up to 5 links at once)
 - Sends videos back through Telegram (up to 50 MB)
 
 ## Setup
@@ -18,8 +20,6 @@ A simple Telegram bot that downloads Pinterest videos and sends the clean MP4 ba
 3. Set environment variables:
    ```
    TELEGRAM_BOT_TOKEN=your_token_here
-   # Optional
-   PIN_PROXY_URL=socks5://user:pass@host:port
    ```
 
 ## Run
@@ -33,7 +33,6 @@ python pinterest_bot.py
 1. Create a new project and connect your GitHub repo.
 2. Set environment variables in Railway:
    - `TELEGRAM_BOT_TOKEN`
-   - `PIN_PROXY_URL` (optional)
 3. Deploy. Railway will run the worker using the `Procfile` or `nixpacks.toml`.
 
 ## Security Notes
