@@ -17,6 +17,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import logging
 import tempfile
+from urllib import request as urlrequest, error as urlerror
 
 from telegram import Update
 from telegram.ext import (
@@ -74,6 +75,7 @@ def download_pinterest_video(url: str, output_dir: str) -> str | None:
         "no_warnings": True,
         "retries": 5,
         "socket_timeout": 30,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
     }
     if PROXY_URL:
         ydl_opts["proxy"] = PROXY_URL
@@ -98,6 +100,25 @@ def download_pinterest_video(url: str, output_dir: str) -> str | None:
         logger.error("Unexpected error: %s", e)
 
     return None
+
+
+def expand_url(url: str) -> str:
+    """Resolve short links (like pin.it) to their final URL."""
+    if not url.lower().startswith("http"):
+        return url
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        req = urlrequest.Request(url, headers=headers, method="HEAD")
+        with urlrequest.urlopen(req, timeout=10) as resp:
+            return resp.geturl()
+    except Exception:
+        try:
+            req = urlrequest.Request(url, headers=headers, method="GET")
+            with urlrequest.urlopen(req, timeout=10) as resp:
+                return resp.geturl()
+        except Exception as e:
+            logger.warning("Failed to expand URL %s: %s", url, e)
+            return url
 
 
 # ─────────────────────────────────────────────
@@ -156,8 +177,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     with tempfile.TemporaryDirectory() as tmpdir:
         loop = asyncio.get_event_loop()
+        resolved_url = await loop.run_in_executor(None, expand_url, text)
         video_path = await loop.run_in_executor(
-            None, download_pinterest_video, text, tmpdir
+            None, download_pinterest_video, resolved_url, tmpdir
         )
 
         if not video_path:
