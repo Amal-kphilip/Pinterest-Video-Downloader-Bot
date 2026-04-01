@@ -178,6 +178,41 @@ def try_update_video_metadata(video_path: str) -> str:
         os.utime(video_path, None)
     except Exception as e:
         logger.warning("Failed to update embedded metadata: %s", e)
+        return video_path
+
+    # Some Android galleries ignore copied metadata. Re-encode to force new date.
+    reencode_path = os.path.splitext(video_path)[0] + "_reencode.mp4"
+    reencode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "faststart",
+        "-metadata",
+        f"creation_time={ts}",
+        "-metadata",
+        f"com.apple.quicktime.creationdate={ts}",
+        "-metadata",
+        f"date={ts}",
+        reencode_path,
+    ]
+    try:
+        subprocess.run(reencode_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.replace(reencode_path, video_path)
+        os.utime(video_path, None)
+        logger.info("Re-encoded video to enforce current date metadata.")
+    except Exception as e:
+        logger.warning("Failed to re-encode for date fix: %s", e)
     return video_path
 
 
