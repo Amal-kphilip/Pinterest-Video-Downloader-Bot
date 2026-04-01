@@ -19,7 +19,13 @@ import logging
 import tempfile
 from urllib import request as urlrequest, error as urlerror
 
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
+    MenuButtonCommands,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -44,6 +50,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────
+# UI / MENU
+# ─────────────────────────────────────────────
+MENU_DOWNLOAD = "📌 Download Video"
+MENU_HELP = "❓ Help"
+MENU_ABOUT = "ℹ️ About"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(MENU_DOWNLOAD)],
+        [KeyboardButton(MENU_HELP), KeyboardButton(MENU_ABOUT)],
+    ],
+    resize_keyboard=True,
+)
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -132,14 +152,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome message."""
     text = (
         "👋 *Welcome to the Pinterest Video Downloader Bot!*\n\n"
-        "📌 Just send me any Pinterest video link and I'll send back the "
-        "clean MP4 — *no watermarks, no hassle*.\n\n"
-        "Supports:\n"
-        "• `pinterest.com` links\n"
-        "• `pin.it` short links\n\n"
-        "_Paste a link to get started!_"
+        "*What can this bot do?*\n"
+        "• Download Pinterest videos with no watermark\n"
+        "• Accept `pinterest.com` and `pin.it` links\n"
+        "• Send the video back instantly (up to 50 MB)\n\n"
+        "Tap a button below or paste a link to get started."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,7 +171,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "4. Receive your clean MP4!\n\n"
         "For issues, make sure the Pin actually contains a video."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """About message."""
+    text = (
+        "ℹ️ *About this bot*\n\n"
+        "Send a Pinterest video link and I’ll fetch the best available quality "
+        "and deliver it here. Video-only output is enabled.\n\n"
+        "Tip: If a link fails, try another pin or wait a moment."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -160,10 +190,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = update.message
     text = (message.text or "").strip()
 
+    # Menu buttons
+    if text == MENU_DOWNLOAD:
+        await message.reply_text(
+            "📌 Send me a Pinterest video link (starts with https://).",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    if text == MENU_HELP:
+        await help_command(update, context)
+        return
+    if text == MENU_ABOUT:
+        await about_command(update, context)
+        return
+
     # Basic URL check
     if not text.startswith("http"):
         await message.reply_text(
-            "❓ Please send a valid Pinterest URL (starts with https://)."
+            "❓ Please send a valid Pinterest URL (starts with https://).",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -172,6 +217,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "⚠️ That doesn't look like a Pinterest link.\n"
             "Please send a `pinterest.com` or `pin.it` URL.",
             parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -219,6 +265,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_msg.edit_text(
                 "❌ Failed to upload the video. Please try again."
             )
+
+
+async def post_init(app: Application) -> None:
+    """Set bot commands and menu button."""
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Show welcome message"),
+                BotCommand("help", "How to use the bot"),
+                BotCommand("about", "About this bot"),
+                BotCommand("menu", "Show menu buttons"),
+            ]
+        )
+        await app.bot.set_my_short_description("Download Pinterest videos instantly.")
+        await app.bot.set_my_description(
+            "Send a Pinterest video link and receive a clean, video-only MP4. "
+            "Supports pinterest.com and pin.it links."
+        )
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e:
+        logger.warning("Failed to set bot profile info: %s", e)
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -235,10 +302,12 @@ def main() -> None:
         pool_timeout=30,
     )
 
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
+    app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("menu", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running… Press Ctrl+C to stop.")
