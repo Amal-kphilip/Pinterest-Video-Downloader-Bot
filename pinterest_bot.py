@@ -208,7 +208,8 @@ def _oembed_image_url(pin_url: str) -> str | None:
     """Try Pinterest oEmbed to get a thumbnail image URL."""
     try:
         oembed_url = "https://www.pinterest.com/oembed.json"
-        resp = requests.get(oembed_url, params={"url": pin_url}, timeout=10)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(oembed_url, params={"url": pin_url}, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         thumb = data.get("thumbnail_url")
@@ -219,7 +220,9 @@ def _oembed_image_url(pin_url: str) -> str | None:
     return None
 
 
-def detect_pinterest_image(pin_url: str, allow_thumbnail: bool = False) -> str | None:
+def detect_pinterest_image(
+    pin_url: str, allow_thumbnail: bool = False, strict_video_check: bool = True
+) -> str | None:
     """
     Detect if a Pinterest URL is an image pin.
     Returns a direct image URL when possible, otherwise None.
@@ -234,7 +237,7 @@ def detect_pinterest_image(pin_url: str, allow_thumbnail: bool = False) -> str |
             return oembed_img
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        resp = requests.get(pin_url, headers=headers, timeout=10)
+        resp = requests.get(pin_url, headers=headers, timeout=10, allow_redirects=True)
         resp.raise_for_status()
         page = resp.text
     except Exception as e:
@@ -244,7 +247,8 @@ def detect_pinterest_image(pin_url: str, allow_thumbnail: bool = False) -> str |
         return None
 
     # If video metadata exists, treat it as a video pin
-    if re.search(r'property="og:video', page):
+    has_video = bool(re.search(r'property="og:video', page))
+    if strict_video_check and has_video:
         return None
 
     match = re.search(r'property="og:image"\s+content="([^"]+)"', page)
@@ -344,7 +348,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Send multiple Pinterest links in one message, one per line.\n"
         "• Choose a quality once, and I’ll download them sequentially.\n\n"
         "*Image upscaling*\n"
-        "• Send a Pinterest image link and tap *Upscale Image*, or\n"
+        "• Tap *Upscale Image* and send the image link, or\n"
         "• Use `/upscale <image url>` and choose 2x/3x/4x.\n\n"
         "For issues, make sure the Pin actually contains a video."
     )
@@ -361,13 +365,37 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
+async def begin_upscale_from_url(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, strict_video_check: bool
+) -> None:
+    """Start the upscale flow for a given URL."""
+    loop = asyncio.get_event_loop()
+    resolved_url = await loop.run_in_executor(None, expand_url, url)
+    image_url = await loop.run_in_executor(
+        None, detect_pinterest_image, resolved_url, True, strict_video_check
+    )
+    if not image_url:
+        await update.message.reply_text(
+            "⚠️ That link doesn’t look like an image pin.\n"
+            "Send a Pinterest image URL to upscale.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    context.user_data["pending_image_url"] = image_url
+    await update.message.reply_text(
+        "Select upscale factor (default 2x):",
+        reply_markup=UPSCALE_KEYBOARD,
+    )
+
 
 async def upscale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Upscale a Pinterest image via /upscale <url>."""
     message = update.message
     if not context.args:
+        context.user_data["awaiting_upscale_url"] = True
         await message.reply_text(
-            "Usage: /upscale <pinterest image url>",
+            "🔍 Send the Pinterest image link now.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -380,28 +408,26 @@ async def upscale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    loop = asyncio.get_event_loop()
-    resolved_url = await loop.run_in_executor(None, expand_url, url)
-    image_url = await loop.run_in_executor(None, detect_pinterest_image, resolved_url, True)
-    if not image_url:
-        await message.reply_text(
-            "⚠️ That link doesn’t look like an image pin.\n"
-            "Send a Pinterest image URL to upscale.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    context.user_data["pending_image_url"] = image_url
-    await message.reply_text(
-        "Select upscale factor (default 2x):",
-        reply_markup=UPSCALE_KEYBOARD,
-    )
+    await begin_upscale_from_url(update, context, url, strict_video_check=False)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Main handler — download and send the video."""
     message = update.message
     text = (message.text or "").strip()
+
+    # If user requested upscale flow, accept the next link
+    if context.user_data.get("awaiting_upscale_url"):
+        urls = extract_urls(text)
+        if not urls:
+            await message.reply_text(
+                "🔍 Please send a Pinterest image link.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        context.user_data["awaiting_upscale_url"] = False
+        await begin_upscale_from_url(update, context, urls[0], strict_video_check=False)
+        return
 
     # Menu buttons
     if text == MENU_DOWNLOAD:
@@ -411,8 +437,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     if text == MENU_UPSCALE:
+        context.user_data["awaiting_upscale_url"] = True
         await message.reply_text(
-            "🔍 Send a Pinterest image link to upscale (or use `/upscale <url>`).",
+            "🔍 Send the Pinterest image link now (or use `/upscale <url>`).",
             parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
@@ -446,7 +473,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(pinterest_urls) == 1:
         loop = asyncio.get_event_loop()
         resolved_url = await loop.run_in_executor(None, expand_url, pinterest_urls[0])
-        image_url = await loop.run_in_executor(None, detect_pinterest_image, resolved_url, True)
+        image_url = await loop.run_in_executor(
+            None, detect_pinterest_image, resolved_url, True, True
+        )
         if image_url:
             context.user_data["pending_image_url"] = image_url
             await message.reply_text(
