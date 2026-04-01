@@ -28,6 +28,14 @@ A simple Telegram bot that downloads Pinterest videos and sends the clean MP4 ba
 python pinterest_bot.py
 ```
 
+## Deploy on Railway
+
+1. Create a new project and connect your GitHub repo.
+2. Set environment variables in Railway:
+   - `TELEGRAM_BOT_TOKEN`
+   - `PIN_PROXY_URL` (optional)
+3. Deploy. Railway will run the worker using the `Procfile` or `nixpacks.toml`.
+
 ## Security Notes
 
 - Never commit your bot token or proxy credentials.
