@@ -63,12 +63,13 @@ logger = logging.getLogger(__name__)
 # UI / MENU
 # ─────────────────────────────────────────────
 MENU_DOWNLOAD = "📌 Download Video"
+MENU_UPSCALE = "🔍 Upscale Image"
 MENU_HELP = "❓ Help"
 MENU_ABOUT = "ℹ️ About"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton(MENU_DOWNLOAD)],
+        [KeyboardButton(MENU_DOWNLOAD), KeyboardButton(MENU_UPSCALE)],
         [KeyboardButton(MENU_HELP), KeyboardButton(MENU_ABOUT)],
     ],
     resize_keyboard=True,
@@ -203,13 +204,34 @@ def is_image_url(url: str) -> bool:
     return cleaned.endswith((".jpg", ".jpeg", ".png", ".webp"))
 
 
-def detect_pinterest_image(pin_url: str) -> str | None:
+def _oembed_image_url(pin_url: str) -> str | None:
+    """Try Pinterest oEmbed to get a thumbnail image URL."""
+    try:
+        oembed_url = "https://www.pinterest.com/oembed.json"
+        resp = requests.get(oembed_url, params={"url": pin_url}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        thumb = data.get("thumbnail_url")
+        if thumb:
+            return thumb
+    except Exception as e:
+        logger.info("oEmbed lookup failed: %s", e)
+    return None
+
+
+def detect_pinterest_image(pin_url: str, allow_thumbnail: bool = False) -> str | None:
     """
     Detect if a Pinterest URL is an image pin.
     Returns a direct image URL when possible, otherwise None.
     """
     if is_image_url(pin_url):
         return pin_url
+    if "pinimg.com" in pin_url:
+        return pin_url
+    if allow_thumbnail:
+        oembed_img = _oembed_image_url(pin_url)
+        if oembed_img:
+            return oembed_img
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         resp = requests.get(pin_url, headers=headers, timeout=10)
@@ -217,6 +239,8 @@ def detect_pinterest_image(pin_url: str) -> str | None:
         page = resp.text
     except Exception as e:
         logger.warning("Failed to fetch pin page: %s", e)
+        if allow_thumbnail:
+            return _oembed_image_url(pin_url)
         return None
 
     # If video metadata exists, treat it as a video pin
@@ -228,6 +252,8 @@ def detect_pinterest_image(pin_url: str) -> str | None:
         match = re.search(r'name="og:image"\s+content="([^"]+)"', page)
     if match:
         return html.unescape(match.group(1))
+    if allow_thumbnail:
+        return _oembed_image_url(pin_url)
     return None
 
 
@@ -356,7 +382,7 @@ async def upscale_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     loop = asyncio.get_event_loop()
     resolved_url = await loop.run_in_executor(None, expand_url, url)
-    image_url = await loop.run_in_executor(None, detect_pinterest_image, resolved_url)
+    image_url = await loop.run_in_executor(None, detect_pinterest_image, resolved_url, True)
     if not image_url:
         await message.reply_text(
             "⚠️ That link doesn’t look like an image pin.\n"
@@ -381,6 +407,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text == MENU_DOWNLOAD:
         await message.reply_text(
             "📌 Send me a Pinterest video link (starts with https://).",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    if text == MENU_UPSCALE:
+        await message.reply_text(
+            "🔍 Send a Pinterest image link to upscale (or use `/upscale <url>`).",
+            parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -413,7 +446,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(pinterest_urls) == 1:
         loop = asyncio.get_event_loop()
         resolved_url = await loop.run_in_executor(None, expand_url, pinterest_urls[0])
-        image_url = await loop.run_in_executor(None, detect_pinterest_image, resolved_url)
+        image_url = await loop.run_in_executor(None, detect_pinterest_image, resolved_url, True)
         if image_url:
             context.user_data["pending_image_url"] = image_url
             await message.reply_text(
