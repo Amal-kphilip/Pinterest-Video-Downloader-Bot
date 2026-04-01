@@ -75,6 +75,15 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+ACTIONS_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("📌 Download Video", callback_data="menu:download"),
+            InlineKeyboardButton("🔍 Upscale Image", callback_data="menu:upscale"),
+        ]
+    ]
+)
+
 QUALITY_FORMATS = {
     # Primary format per quality, with fallback to next best quality
     "360": ["V_HLSV3_MOBILE-523"],
@@ -203,10 +212,24 @@ def is_image_url(url: str) -> bool:
     cleaned = url.split("?")[0].lower()
     return cleaned.endswith((".jpg", ".jpeg", ".png", ".webp"))
 
+def normalize_pinterest_url(url: str) -> str:
+    """Normalize Pinterest URLs to a canonical pin URL when possible."""
+    if not url:
+        return url
+    if "pinimg.com" in url:
+        return url.split("#")[0]
+    clean = url.split("#")[0]
+    match = re.search(r"/pin/(\d+)", clean)
+    if match:
+        pin_id = match.group(1)
+        return f"https://www.pinterest.com/pin/{pin_id}/"
+    return clean.split("?")[0]
+
 
 def _oembed_image_url(pin_url: str) -> str | None:
     """Try Pinterest oEmbed to get a thumbnail image URL."""
     try:
+        pin_url = normalize_pinterest_url(pin_url)
         oembed_url = "https://www.pinterest.com/oembed.json"
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(oembed_url, params={"url": pin_url}, headers=headers, timeout=10)
@@ -227,6 +250,7 @@ def detect_pinterest_image(
     Detect if a Pinterest URL is an image pin.
     Returns a direct image URL when possible, otherwise None.
     """
+    pin_url = normalize_pinterest_url(pin_url)
     if is_image_url(pin_url):
         return pin_url
     if "pinimg.com" in pin_url:
@@ -256,6 +280,13 @@ def detect_pinterest_image(
         match = re.search(r'name="og:image"\s+content="([^"]+)"', page)
     if match:
         return html.unescape(match.group(1))
+    # Fallback: look for any pinimg URL in the HTML
+    pinimgs = re.findall(r"https?://i\.pinimg\.com/[^\s\"']+", page)
+    if pinimgs:
+        for img_url in pinimgs:
+            if "/originals/" in img_url:
+                return img_url
+        return pinimgs[0]
     if allow_thumbnail:
         return _oembed_image_url(pin_url)
     return None
@@ -334,6 +365,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Tap a button below or paste a link to get started."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text("Quick actions:", reply_markup=ACTIONS_KEYBOARD)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -587,6 +619,28 @@ async def upscale_prompt_callback(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=UPSCALE_KEYBOARD,
     )
 
+async def menu_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline menu actions without sending a user message."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    if query.data == "menu:download":
+        await query.message.reply_text(
+            "📌 Send me a Pinterest video link (starts with https://).",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    if query.data == "menu:upscale":
+        context.user_data["awaiting_upscale_url"] = True
+        await query.message.reply_text(
+            "🔍 Send the Pinterest image link now (or use `/upscale <url>`).",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
 
 async def upscale_scale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle upscale factor selection."""
@@ -696,6 +750,7 @@ def main() -> None:
     app.add_handler(CommandHandler("menu", start))
     app.add_handler(CommandHandler("upscale", upscale_command))
     app.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^q:"))
+    app.add_handler(CallbackQueryHandler(menu_action_callback, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(upscale_prompt_callback, pattern=r"^up:prompt$"))
     app.add_handler(CallbackQueryHandler(upscale_scale_callback, pattern=r"^upscale:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
