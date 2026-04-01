@@ -1,5 +1,5 @@
 python-telegram-bot>=20.0,<22.0
 yt-dlp>=2024.1.1
-opencv-python>=4.8
+opencv-python-headless>=4.8
 Pillow>=10.0
 requests>=2.31
