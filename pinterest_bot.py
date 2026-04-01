@@ -250,7 +250,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-        await status_msg.edit_text("📤 Uploading…")
+        await status_msg.edit_text("📤 Sending your video…")
 
         try:
             with open(video_path, "rb") as video_file:
