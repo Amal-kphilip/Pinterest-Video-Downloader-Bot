@@ -19,6 +19,9 @@ import logging
 import tempfile
 from urllib import request as urlrequest
 import re
+import subprocess
+import shutil
+from datetime import datetime, timezone
 
 from telegram import (
     Update,
@@ -26,13 +29,10 @@ from telegram import (
     KeyboardButton,
     BotCommand,
     MenuButtonCommands,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -68,23 +68,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-QUALITY_FORMATS = {
-    # Primary format per quality, with fallback to next best quality
-    "360": ["V_HLSV3_MOBILE-523"],
-    "540": ["V_HLSV3_MOBILE-808", "V_HLSV3_MOBILE-523"],
-    "720": ["V_HLSV3_MOBILE-1299", "V_HLSV3_MOBILE-808", "V_HLSV3_MOBILE-523"],
-}
-
-QUALITY_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("📱 360p", callback_data="q:360"),
-            InlineKeyboardButton("📺 540p", callback_data="q:540"),
-            InlineKeyboardButton("🎬 720p", callback_data="q:720"),
-        ]
-    ]
-)
-
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
@@ -101,18 +84,15 @@ def is_pinterest_url(url: str) -> bool:
     return any(domain in url.lower() for domain in pinterest_domains)
 
 
-def download_pinterest_video(
-    url: str, output_dir: str, format_chain: list[str]
-) -> tuple[str | None, str | None]:
+def download_pinterest_video(url: str, output_dir: str) -> tuple[str | None, str | None]:
     """
     Download the best-quality video from a Pinterest URL.
     Returns (file path, format used) on success, (None, None) on failure.
     yt-dlp fetches the original source video, so there is NO watermark.
     """
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
-    # Final fallback for pins that don't expose the mobile format IDs
-    format_chain = format_chain + ["bestvideo*/best"]
-
+    # Highest available video-only quality
+    format_chain = ["bestvideo*/best"]
     for fmt in format_chain:
         ydl_opts = {
             # Video-only, with quality fallback
@@ -153,6 +133,44 @@ def download_pinterest_video(
     return None, None
 
 
+def try_update_video_metadata(video_path: str) -> str:
+    """
+    Attempt to update embedded creation_time metadata using ffmpeg (if available).
+    Returns the (possibly new) file path.
+    """
+    ext = os.path.splitext(video_path)[1].lower()
+    if ext not in (".mp4", ".mov"):
+        return video_path
+
+    if not shutil.which("ffmpeg"):
+        return video_path
+
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    fixed_path = os.path.splitext(video_path)[0] + "_fixed" + ext
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-c",
+        "copy",
+        "-map",
+        "0",
+        "-metadata",
+        f"creation_time={ts}",
+        "-metadata:s:v:0",
+        f"creation_time={ts}",
+        fixed_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.replace(fixed_path, video_path)
+        os.utime(video_path, None)
+    except Exception as e:
+        logger.warning("Failed to update embedded metadata: %s", e)
+    return video_path
+
+
 def expand_url(url: str) -> str:
     """Resolve short links (like pin.it) to their final URL."""
     if not url.lower().startswith("http"):
@@ -191,7 +209,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Send the video back instantly (up to 50 MB)\n\n"
         "*Batch download*\n"
         "• Send up to 5 links in one message (one per line)\n"
-        "• Pick quality once and I’ll download them one by one\n\n"
+        "• I’ll download them one by one in the best quality\n\n"
         "Tap a button below or paste a link to get started."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
@@ -207,7 +225,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "4. Receive your clean MP4!\n\n"
         "*Batch download (up to 5 links)*\n"
         "• Send multiple Pinterest links in one message, one per line.\n"
-        "• Choose a quality once, and I’ll download them sequentially.\n\n"
+        "• I’ll download them sequentially in the best quality.\n\n"
         "For issues, make sure the Pin actually contains a video."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
@@ -268,47 +286,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         pinterest_urls = pinterest_urls[:5]
 
-    context.user_data["pending_urls"] = pinterest_urls
-    await message.reply_text(
-        f"Select a quality for {len(pinterest_urls)} video(s):",
-        reply_markup=QUALITY_KEYBOARD,
-    )
-    return
-
-
-async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle quality selection and download batch."""
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-
-    data = query.data or ""
-    quality = data.split(":")[1] if ":" in data else None
-    if quality not in QUALITY_FORMATS:
-        await query.edit_message_text("⚠️ Invalid quality selection. Please try again.")
-        return
-
-    urls = context.user_data.get("pending_urls") or []
-    if not urls:
-        await query.edit_message_text("⚠️ No pending downloads. Send a link again.")
-        return
-
-    format_chain = QUALITY_FORMATS[quality]
-    await query.edit_message_text(f"✅ Selected {quality}p. Starting downloads…")
+    await message.reply_text(f"⏳ Starting download of {len(pinterest_urls)} video(s)…")
 
     # Process each URL sequentially
     with tempfile.TemporaryDirectory() as tmpdir:
         loop = asyncio.get_event_loop()
-        total = len(urls)
-        for idx, url in enumerate(urls, start=1):
-            logger.info("Downloading %s/%s | quality=%sp | url=%s", idx, total, quality, url)
-            status_msg = await query.message.reply_text(
+        total = len(pinterest_urls)
+        for idx, url in enumerate(pinterest_urls, start=1):
+            logger.info("Downloading %s/%s | url=%s", idx, total, url)
+            status_msg = await message.reply_text(
                 f"⏳ Downloading video {idx} of {total}…"
             )
             resolved_url = await loop.run_in_executor(None, expand_url, url)
             video_path, used_fmt = await loop.run_in_executor(
-                None, download_pinterest_video, resolved_url, tmpdir, format_chain
+                None, download_pinterest_video, resolved_url, tmpdir
             )
 
             if not video_path:
@@ -318,11 +309,8 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
                 continue
             logger.info("Downloaded with format: %s", used_fmt)
-            # Ensure file timestamp is current
-            try:
-                os.utime(video_path, None)
-            except Exception as e:
-                logger.warning("Failed to update file timestamp: %s", e)
+            # Update embedded metadata + file timestamp (if possible)
+            video_path = try_update_video_metadata(video_path)
 
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             if file_size_mb > 50:
@@ -336,7 +324,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             try:
                 with open(video_path, "rb") as video_file:
-                    await query.message.reply_video(
+                    await message.reply_video(
                         video=video_file,
                         caption="✅ Here's your Pinterest video — no watermark!",
                         supports_streaming=True,
@@ -348,8 +336,6 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await status_msg.edit_text(
                     f"❌ Failed to upload video {idx}. Please try again."
                 )
-
-    context.user_data["pending_urls"] = []
 
 
 async def post_init(app: Application) -> None:
@@ -393,7 +379,6 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("menu", start))
-    app.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^q:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running… Press Ctrl+C to stop.")
