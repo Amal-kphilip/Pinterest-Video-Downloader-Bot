@@ -68,10 +68,11 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-QUALITY_CHOICES = {
-    "360": "V_HLSV3_MOBILE-523/best",
-    "540": "V_HLSV3_MOBILE-808/V_HLSV3_MOBILE-523/best",
-    "720": "V_HLSV3_MOBILE-1299/V_HLSV3_MOBILE-808/V_HLSV3_MOBILE-523/best",
+QUALITY_FORMATS = {
+    # Primary format per quality, with fallback to next best quality
+    "360": ["V_HLSV3_MOBILE-523"],
+    "540": ["V_HLSV3_MOBILE-808", "V_HLSV3_MOBILE-523"],
+    "720": ["V_HLSV3_MOBILE-1299", "V_HLSV3_MOBILE-808", "V_HLSV3_MOBILE-523"],
 }
 
 QUALITY_KEYBOARD = InlineKeyboardMarkup(
@@ -99,45 +100,56 @@ def is_pinterest_url(url: str) -> bool:
     return any(domain in url.lower() for domain in pinterest_domains)
 
 
-def download_pinterest_video(url: str, output_dir: str, format_string: str) -> str | None:
+def download_pinterest_video(
+    url: str, output_dir: str, format_chain: list[str]
+) -> tuple[str | None, str | None]:
     """
     Download the best-quality video from a Pinterest URL.
-    Returns the file path on success, None on failure.
+    Returns (file path, format used) on success, (None, None) on failure.
     yt-dlp fetches the original source video, so there is NO watermark.
     """
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
+    # Final fallback for pins that don't expose the mobile format IDs
+    format_chain = format_chain + ["bestvideo*/best"]
 
-    ydl_opts = {
-        # Video-only, with quality fallback
-        "format": format_string,
-        "outtmpl": output_template,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 5,
-        "socket_timeout": 30,
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-    }
+    for fmt in format_chain:
+        ydl_opts = {
+            # Video-only, with quality fallback
+            "format": fmt,
+            "outtmpl": output_template,
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 5,
+            "socket_timeout": 30,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        }
+        try:
+            logger.info("Trying format: %s", fmt)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # Resolve the actual filename
+                filename = ydl.prepare_filename(info)
+                # yt-dlp may change the extension after merge
+                base = os.path.splitext(filename)[0]
+                for ext in ("mp4", "mkv", "webm", "mov"):
+                    candidate = f"{base}.{ext}"
+                    if os.path.exists(candidate):
+                        return candidate, fmt
+                # Fallback: return whatever was written
+                if os.path.exists(filename):
+                    return filename, fmt
+        except yt_dlp.utils.DownloadError as e:
+            msg = str(e)
+            if "Requested format is not available" in msg:
+                logger.info("Format unavailable: %s", fmt)
+                continue
+            logger.error("yt-dlp download error: %s", e)
+            return None, None
+        except Exception as e:
+            logger.error("Unexpected error: %s", e)
+            return None, None
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Resolve the actual filename
-            filename = ydl.prepare_filename(info)
-            # yt-dlp may change the extension after merge
-            base = os.path.splitext(filename)[0]
-            for ext in ("mp4", "mkv", "webm", "mov"):
-                candidate = f"{base}.{ext}"
-                if os.path.exists(candidate):
-                    return candidate
-            # Fallback: return whatever was written
-            if os.path.exists(filename):
-                return filename
-    except yt_dlp.utils.DownloadError as e:
-        logger.error("yt-dlp download error: %s", e)
-    except Exception as e:
-        logger.error("Unexpected error: %s", e)
-
-    return None
+    return None, None
 
 
 def expand_url(url: str) -> str:
@@ -266,7 +278,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     data = query.data or ""
     quality = data.split(":")[1] if ":" in data else None
-    if quality not in QUALITY_CHOICES:
+    if quality not in QUALITY_FORMATS:
         await query.edit_message_text("⚠️ Invalid quality selection. Please try again.")
         return
 
@@ -275,7 +287,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("⚠️ No pending downloads. Send a link again.")
         return
 
-    format_string = QUALITY_CHOICES[quality]
+    format_chain = QUALITY_FORMATS[quality]
     await query.edit_message_text(f"✅ Selected {quality}p. Starting downloads…")
 
     # Process each URL sequentially
@@ -288,8 +300,8 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"⏳ Downloading video {idx} of {total}…"
             )
             resolved_url = await loop.run_in_executor(None, expand_url, url)
-            video_path = await loop.run_in_executor(
-                None, download_pinterest_video, resolved_url, tmpdir, format_string
+            video_path, used_fmt = await loop.run_in_executor(
+                None, download_pinterest_video, resolved_url, tmpdir, format_chain
             )
 
             if not video_path:
@@ -298,6 +310,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     f"❌ Failed to download video {idx} of {total}.\n{url}"
                 )
                 continue
+            logger.info("Downloaded with format: %s", used_fmt)
 
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             if file_size_mb > 50:
