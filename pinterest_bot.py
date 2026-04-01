@@ -337,11 +337,14 @@ def upscale_image_bytes(image_bytes: bytes, scale: int) -> tuple[bytes | None, t
     ext = "png" if fmt == "PNG" else "webp" if fmt == "WEBP" else "jpg"
     if fmt == "JPEG":
         out_img = out_img.convert("RGB")
-        out_img.save(buf, format="JPEG", quality=95)
+        # Max quality JPEG with no chroma subsampling
+        out_img.save(buf, format="JPEG", quality=100, subsampling=0, optimize=True)
     elif fmt == "PNG":
-        out_img.save(buf, format="PNG", optimize=True)
+        # Lossless
+        out_img.save(buf, format="PNG")
     else:
-        out_img.save(buf, format="WEBP", quality=95, method=6)
+        # Lossless WebP to preserve quality
+        out_img.save(buf, format="WEBP", lossless=True, quality=100, method=6)
     return buf.getvalue(), (orig_w, orig_h), (new_w, new_h), ext, None
 
 
