@@ -188,6 +188,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Download Pinterest videos with no watermark\n"
         "• Accept `pinterest.com` and `pin.it` links\n"
         "• Send the video back instantly (up to 50 MB)\n\n"
+        "*Batch download*\n"
+        "• Send up to 5 links in one message (one per line)\n"
+        "• Pick quality once and I’ll download them one by one\n\n"
         "Tap a button below or paste a link to get started."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
@@ -201,6 +204,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "2. Tap *Share → Copy Link*.\n"
         "3. Paste the link here.\n"
         "4. Receive your clean MP4!\n\n"
+        "*Batch download (up to 5 links)*\n"
+        "• Send multiple Pinterest links in one message, one per line.\n"
+        "• Choose a quality once, and I’ll download them sequentially.\n\n"
         "For issues, make sure the Pin actually contains a video."
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
