@@ -404,10 +404,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             try:
                 with open(video_path, "rb") as video_file:
-                    await message.reply_video(
-                        video=video_file,
+                    await message.reply_document(
+                        document=video_file,
                         caption="✅ Here's your Pinterest video — no watermark!",
-                        supports_streaming=True,
+                        filename=os.path.basename(video_path),
                     )
                 await status_msg.delete()
                 logger.info("Sent video %s/%s", idx, total)
