@@ -318,6 +318,11 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
                 continue
             logger.info("Downloaded with format: %s", used_fmt)
+            # Ensure file timestamp is current
+            try:
+                os.utime(video_path, None)
+            except Exception as e:
+                logger.warning("Failed to update file timestamp: %s", e)
 
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             if file_size_mb > 50:
