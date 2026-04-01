@@ -69,7 +69,10 @@ def download_pinterest_video(url: str, output_dir: str) -> str | None:
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     ydl_opts = {
-        "format": "V_HLSV3_MOBILE-1299/V_HLSV3_MOBILE-808/V_HLSV3_MOBILE-523/best",
+        # Let yt-dlp pick the best available format for each pin.
+        # The previous hardcoded Pinterest formats can fail on many pins.
+        # Video-only (no audio) as requested
+        "format": "bestvideo*/best",
         "outtmpl": output_template,
         "quiet": True,
         "no_warnings": True,
